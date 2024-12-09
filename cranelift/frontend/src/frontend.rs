@@ -34,6 +34,7 @@ pub struct FunctionBuilderContext {
     stack_map_vars: EntitySet<Variable>,
     stack_map_values: EntitySet<Value>,
     safepoints: safepoints::SafepointSpiller,
+    checkpoint: safepoints::CheckpointInjector,
 }
 
 /// Temporary object used to build a single Cranelift IR [`Function`].
@@ -75,6 +76,7 @@ impl FunctionBuilderContext {
             stack_map_vars,
             stack_map_values,
             safepoints,
+            checkpoint,
         } = self;
         ssa.clear();
         status.clear();
@@ -82,6 +84,7 @@ impl FunctionBuilderContext {
         stack_map_values.clear();
         stack_map_vars.clear();
         safepoints.clear();
+        checkpoint.clear();
     }
 
     fn is_empty(&self) -> bool {
@@ -723,6 +726,30 @@ impl<'a> FunctionBuilder<'a> {
                 .safepoints
                 .run(&mut self.func, &self.func_ctx.stack_map_values);
         }
+
+        log::trace!(
+            "inspect: Before checkpoint insertion"
+        );
+        // Add the checkpoint instructions
+        self.func_ctx
+            .checkpoint
+            .run(&mut self.func);
+
+        // Add the resume procedure as BB (to load the checkpointed value).
+        // This new BB will be the new entry block.
+        let resume_block = self.create_block();
+
+        // Prepare the first block from which to resume.
+        let dest_block = ir::Block::from_u32(0);
+        let dest_block_arg = self.block_params(dest_block).to_vec();
+
+        self.func_ctx
+            .checkpoint
+            .insert_resume(
+                self.func,
+                resume_block,
+                dest_block,
+                dest_block_arg);
 
         // Clear the state (but preserve the allocated buffers) in preparation
         // for translation another function.

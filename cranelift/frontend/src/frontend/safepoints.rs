@@ -263,6 +263,13 @@ pub(crate) struct LivenessAnalysis {
     /// processing a block.
     currently_live: LiveSet,
 
+    /// A map from a block's post-order index to its value definitions.
+    val_defs : Vec<LiveSet>,
+
+    /// A map from a block's post-order index to its set of live register
+    /// to checkpoint, corresponding to the intersection of live_outs and val_defs.
+    ckpt_vals: Vec<LiveSet>,
+
     /// A mapping from each safepoint instruction to the set of needs-stack-map
     /// values that are live across it.
     safepoints: HashMap<ir::Inst, SmallVec<[ir::Value; 4]>>,
@@ -283,6 +290,8 @@ impl Default for LivenessAnalysis {
             live_ins: Default::default(),
             live_outs: Default::default(),
             currently_live: Default::default(),
+            val_defs : Default::default(),
+            ckpt_vals: Default::default(),
             safepoints: Default::default(),
             live_across_any_safepoint: Default::default(),
         }
@@ -308,6 +317,8 @@ impl LivenessAnalysis {
             live_ins,
             live_outs,
             currently_live,
+            val_defs,
+            ckpt_vals,
             safepoints,
             live_across_any_safepoint,
         } = self;
@@ -319,6 +330,8 @@ impl LivenessAnalysis {
         live_ins.clear();
         live_outs.clear();
         currently_live.clear();
+        val_defs.clear();
+        ckpt_vals.clear();
         safepoints.clear();
         live_across_any_safepoint.clear();
     }
@@ -335,6 +348,8 @@ impl LivenessAnalysis {
             live_ins,
             live_outs,
             currently_live: _,
+            val_defs,
+            ckpt_vals,
             safepoints: _,
             live_across_any_safepoint: _,
         } = self;
@@ -346,6 +361,8 @@ impl LivenessAnalysis {
         predecessors.resize(capacity, Default::default());
         live_ins.resize(capacity, Default::default());
         live_outs.resize(capacity, Default::default());
+        val_defs.resize(capacity, Default::default());
+        ckpt_vals.resize(capacity, Default::default());
     }
 
     fn initialize_block_to_index_map(&mut self) {
@@ -390,6 +407,21 @@ impl LivenessAnalysis {
         self.safepoints.insert(inst, live);
     }
 
+    /// Record the subset of live registers to be checkpointed.
+    fn record_checkpoint(&mut self, block_index: usize) {
+        // Record the values to be checkpointed (live_outs \cap def).
+        let mut chkpt_vals =
+            self.live_outs[block_index]
+                .iter()
+                .filter(|&val| self.val_defs[block_index].contains(val))
+                .copied()
+                .collect::<Vec<ir::Value>>();
+        // Keep order deterministic.
+        chkpt_vals.sort();
+
+        self.ckpt_vals[block_index].extend(chkpt_vals.iter().copied());
+    }
+
     /// Process a use of a needs-stack-map value, inserting it into the
     /// currently-live set.
     fn process_use(&mut self, func: &Function, inst: Inst, val: Value) {
@@ -424,6 +456,8 @@ impl LivenessAnalysis {
             // Process any needs-stack-map values defined by this instruction.
             for val in func.dfg.inst_results(inst) {
                 self.process_def(*val);
+                // Track the values defined in the block.
+                self.val_defs[block_index].insert(*val);
             }
 
             // If this instruction is a safepoint and we've been asked to record
@@ -452,6 +486,8 @@ impl LivenessAnalysis {
     }
 
     /// Run the liveness analysis on the given function.
+    /// Only a subset of the live values is needed to resume the state of a computation.
+    /// At the end of each block, the checkpointed registers (for each block) are those
     pub fn run(&mut self, func: &mut Function, stack_map_values: &EntitySet<ir::Value>) {
         self.clear();
         self.post_order.extend(self.dfs.post_order_iter(func));
@@ -505,6 +541,9 @@ impl LivenessAnalysis {
         // live-out set.
         for block_index in 0..self.post_order.len() {
             self.process_block(func, stack_map_values, block_index, RecordSafepoints::Yes);
+
+            // Produce the set of values to checkpoint.
+            self.record_checkpoint(block_index);
 
             debug_assert_eq!(
                 self.currently_live, self.live_ins[block_index],
@@ -789,6 +828,194 @@ impl SafepointSpiller {
             vals.extend_from_slice(pos.func.dfg.block_params(block));
             for val in vals.drain(..) {
                 self.rewrite_def(&mut pos, val);
+            }
+        }
+    }
+}
+
+/// A stack, located at the beginning of the linear memory, used for storing
+/// the checkpointed values.
+#[derive(Default)]
+struct CheckpointStack {
+    /// TODO: The checkpoint stack should be located in a secondary linear memory
+    ///     +-------------------+
+    ///     |   could_migrate   |
+    ///     |-------------------|
+    ///     |   current_block   |
+    ///     +-------------------|
+    ///     |                   |
+    ///     |     ckpt_vals     |
+    ///     |                   |
+    ///     +-------------------+
+
+    // A map from each value index to a memory address.
+    value_to_heap: HashMap<ir::Value, ir::Value>,
+
+    // Address of the `could_migrate` flag.
+    cm_address: u32,
+
+    // Address of the `current_block` flag.
+    cb_address: u32
+}
+
+impl CheckpointStack {
+    fn clear(&mut self) {
+        self.value_to_heap.clear();
+        self.cm_address = 0;
+        self.cb_address = 4;
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CheckpointInjector {
+    liveness: LivenessAnalysis,
+    checkpoint_stack: CheckpointStack
+}
+
+impl CheckpointInjector {
+    /// Clear and reset all internal state.
+    pub fn clear(&mut self) {
+        let CheckpointInjector {
+            liveness,
+            checkpoint_stack,
+        } = self;
+        liveness.clear();
+        checkpoint_stack.clear();
+    }
+
+    pub fn run(&mut self,
+               func: &mut Function) {
+        log::trace!(
+            "running the checkpoint injection procedure",
+        );
+
+        // Temporary 'hack' to reduce modifications of the LivenessAnalysis run.
+        let mut stack_map_values: &mut EntitySet<ir::Value> = &mut Default::default();
+
+        self.clear();
+        stack_map_values.clear();
+        for val in func.dfg.values() {
+            stack_map_values.insert(val);
+        }
+        self.liveness.run(func, stack_map_values);
+
+        self.insert_checkpoint(func);
+
+        log::trace!(
+            "after inserting the checkpoints"
+        );
+    }
+
+    fn insert_checkpoint(&mut self, func: &mut Function) {
+        // This is the address of the checkpoint stack top, located in the heap.
+        // The first address is 4, because the first four bytes are reserved for tracking the last
+        // block completing a checkpoint.
+        let mut ckpt_stack_top: i64 =
+            (self.checkpoint_stack.cb_address + ir::types::I32.bytes()) as i64;
+
+        // Post-order pass to add the required load instructions.
+        for block_index in 0..self.liveness.post_order.len() {
+            let block = self.liveness.post_order[block_index];
+            log::trace!("checkpoint: inserting {block:?}");
+
+            if let Some(inst) = func.layout.last_inst(block) {
+                // Iterate over all the values we have to checkpoint.
+                // For each one, compute its address in the heap, and add a store instruction
+                // at the end of the block.
+                for &val in &self.liveness.ckpt_vals[block_index] {
+                    // Select the last instruction in the BB.
+                    let mut pos = FuncCursor::new(func).after_inst(inst);
+
+                    // Move to the last instruction before the terminator.
+                    pos.prev_inst();
+
+                    // Record in memory that we are entering a CS which does not
+                    // tolerate termination (hence migration).
+                    let cm_flag_value =
+                        pos.ins().iconst(ir::types::I32, 0);
+                    let cm_flag_vlue =
+                        pos.ins().iconst(ir::types::I32, self.checkpoint_stack.cm_address as i64);
+                    pos.ins().store(
+                        MemFlags::new(),
+                        cm_flag_value,
+                        cm_flag_vlue,
+                        0);
+
+                    // Compute the address in the heap.
+                    // To do so, create a constant i32 value to store the address at the top
+                    // of the checkpoint stack (in heap).
+                    let ckpt_stack_top_val = pos.ins().iconst(ir::types::I32, ckpt_stack_top);
+
+                    // Keep track of the value and its checkpoint address.
+                    self.checkpoint_stack.value_to_heap.insert(val, ckpt_stack_top_val);
+
+                    // Add the corresponding store instruction.
+                    let mflags = MemFlags::new();
+                    pos.ins().store(mflags, val, ckpt_stack_top_val, 0);
+
+                    // Increment the stack top.
+                    ckpt_stack_top += func.dfg.value_type(val).bytes() as i64;
+                }
+            }
+
+            if let Some(inst) = func.layout.first_inst(block) {
+                // Record in memory that we have reach this block.
+                let mut pos = FuncCursor::new(func).at_first_inst(block);
+                let block_index_value =
+                    pos.ins().iconst(ir::types::I32, block.as_u32() as i64);
+                let cb_flag_vlue =
+                    pos.ins().iconst(ir::types::I32, self.checkpoint_stack.cb_address as i64);
+                pos.ins().store(
+                   MemFlags::new(),
+                   block_index_value,
+                   cb_flag_vlue,
+                    0);
+
+                // Record in memory that the module can now be migrated (end of CS).
+                let cm_flag_value =
+                    pos.ins().iconst(ir::types::I32, 1);
+                let cm_flag_vlue =
+                    pos.ins().iconst(ir::types::I32, self.checkpoint_stack.cm_address as i64);
+                pos.ins().store(
+                    MemFlags::new(),
+                    cm_flag_value,
+                    cm_flag_vlue,
+                    0);
+            }
+        }
+    }
+
+    pub fn insert_resume(&mut self, func: &mut Function,
+                     resume_block: ir::Block,
+                     dest_block: ir::Block,
+                     dest_block_arg: Vec<ir::Value>) {
+        log::trace!("checkpoint: inserting resume");
+
+        // Check if a checkpoint is available from where to resume.
+        if !self.checkpoint_stack.value_to_heap.is_empty() {
+            log::trace!("inspect: the checkpoint is not empty");
+
+            if let Some(inst) = func.layout.last_inst(resume_block) {
+                // Produce a collection for the type of each value
+                // in the checkpoint.
+                let mut val_ty_map : HashMap<ir::Value, ir::Type> = Default::default();
+                for (&val, _) in &self.checkpoint_stack.value_to_heap {
+                    val_ty_map.insert(val, func.dfg.value_type(val));
+                }
+
+                // Populate the resume_block with the load instructions and the jump.
+                let mflags = MemFlags::new();
+                for (val, addr) in self.checkpoint_stack.value_to_heap.iter() {
+                    let mut pos = FuncCursor::new(func).after_inst(inst);
+                    pos.ins().load(*val_ty_map.index(val), mflags, *addr, 0);
+                }
+
+                // Add a jump to the next BB to execute.
+                let mut pos = FuncCursor::new(func).after_inst(inst);
+                pos.ins().jump(dest_block, dest_block_arg.as_slice());
+            }
+            else {
+                log::trace!("debug: missing resume BB");
             }
         }
     }
@@ -2406,4 +2633,71 @@ block3:
             "#,
         );
     }
+
+    #[test]
+    fn checkpoint_insertion_simple() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(ir::types::I32));
+        sig.params.push(AbiParam::new(ir::types::I32));
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut func = Function::with_name_signature(ir::UserFuncName::testcase("sample"), sig);
+        let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+
+        let name = builder
+            .func
+            .declare_imported_user_function(ir::UserExternalName {
+                namespace: 0,
+                index: 0,
+            });
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(ir::types::I32));
+        let signature = builder.func.import_signature(sig);
+        let func_ref = builder.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(name),
+            signature,
+            colocated: true,
+        });
+
+        // Here the value `v1` is technically not live but our single-pass liveness
+        // analysis treats every branch argument to a block as live to avoid
+        // needing to do a fixed-point loop.
+        //
+        //     block0(v0, v1):
+        //       call $foo(v0)
+        //       jump block0(v0, v1)
+        let block0 = builder.create_block();
+        builder.append_block_params_for_function_params(block0);
+        let a = builder.func.dfg.block_params(block0)[0];
+        let b = builder.func.dfg.block_params(block0)[1];
+        builder.declare_value_needs_stack_map(a);
+        builder.declare_value_needs_stack_map(b);
+        builder.switch_to_block(block0);
+        builder.ins().call(func_ref, &[a]);
+        builder.ins().jump(block0, &[a, b]);
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        assert_eq_output!(
+            func.display().to_string(),
+            r#"
+function %sample(i32, i32) system_v {
+    ss0 = explicit_slot 4, align = 4
+    ss1 = explicit_slot 4, align = 4
+    sig0 = (i32) system_v
+    fn0 = colocated u0:0 sig0
+
+block0(v0: i32, v1: i32):
+    stack_store v0, ss0
+    stack_store v1, ss1
+    v4 = stack_load.i32 ss0
+    call fn0(v4), stack_map=[i32 @ ss0+0, i32 @ ss1+0]
+    v2 = stack_load.i32 ss0
+    v3 = stack_load.i32 ss1
+    jump block0(v2, v3)
+}
+            "#
+        );
+    }
+
 }
